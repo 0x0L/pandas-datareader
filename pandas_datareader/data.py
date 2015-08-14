@@ -8,8 +8,10 @@ import tempfile
 import datetime as dt
 import time
 import csv
+import re
 
 from collections import defaultdict
+from itertools import tee, filterfalse
 
 import numpy as np
 
@@ -581,42 +583,119 @@ def get_data_fred(name, start=dt.datetime(2010, 1, 1),
     return df
 
 
-_FAMAFRENCH_URL = 'http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp'
+def get_datasets_famafrench():
+    """
+    Get the list of datasets available from the Fama/French data library.
+
+    Returns the list of available inputs for get_data_famafrench.
+    """
+    from bs4 import BeautifulSoup
+    
+    HEADER, FOOTER = 'ftp/', '_CSV.zip'
+    URL = 'http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html'
+    
+    with urlopen(URL) as socket:
+        root = BeautifulSoup(socket.read(), 'html.parser')
+        
+    keys = filter(lambda x: x.startswith(HEADER) and x.endswith(FOOTER),
+                  [e.attrs['href'] for e in root.findAll('a') if 'href' in e.attrs])
+
+    return list(map(lambda x: x[len(HEADER):-len(FOOTER)], keys))
 
 
-def get_data_famafrench(name):
-    # path of zip files
-    zip_file_path = '{0}/{1}_TXT.zip'.format(_FAMAFRENCH_URL, name)
-
-    with urlopen(zip_file_path) as url:
-        raw = url.read()
+def _download_data_famafrench(name):
+    url = '{0}/{1}_CSV.zip'.format(_FAMAFRENCH_DOC_TEMPLATE, name)
+    with urlopen(url) as socket:
+        raw = socket.read()
 
     with tempfile.TemporaryFile() as tmpf:
         tmpf.write(raw)
 
         with ZipFile(tmpf, 'r') as zf:
-            data = zf.open(zf.namelist()[0]).readlines()
+            data = zf.open(zf.namelist()[0]).read().decode()
+            
+    return data
 
-    line_lengths = np.array(lmap(len, data))
-    file_edges = np.where(line_lengths == 2)[0]
+
+def _parse_date_famafrench(x):
+    # what's the correct python way to do that ??
+    x = x.strip()
+    try: return dt.datetime.strptime(x, '%Y')
+    except: pass
+    try: return dt.datetime.strptime(x, '%Y%m')
+    except: pass
+    return to_datetime(x)
+
+    
+_FAMAFRENCH_URL = 'http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp'
+
+
+_FAMAFRENCH_DOC_TEMPLATE = """Description
+-----------
+
+{}
+
+
+Key(s)
+------
+
+{}
+
+"""
+
+    
+def get_data_famafrench(name):
+    """
+    Get data for the given name from the Fama/French data library.
+    
+    Returns a dictionary. A description of the data is available
+    under the key `DESCR`.
+    
+    For annual and monthly data, index is a PeriodIndex, otherwise
+    it's a DatetimeIndex.
+    """
+    params = {'index_col': 0,
+              'parse_dates': [0],
+              'date_parser': _parse_date_famafrench}
+    
+    if name == 'BE-ME_Breakpoints':
+        # header in that file is not valid
+        params['skiprows'] = 1
+        params['names'] = ['Date', '<=0', '>0'] + list(range(0, 100, 5))
+
+    data = _download_data_famafrench(name)
+
+    # edges between fragments are blank lines
+    # fragments with more than 800 characters are considered data
+    # those with less characters are considered documentation
+    file_edges = [m.end() for m in re.finditer(2*'\r\n', data)]
+    
+    f1, f2 = tee(zip([0] + file_edges, file_edges))
+    p = lambda e: (e[1] - e[0]) > 800
+    doc, fragments = filterfalse(p, f1), filter(p, f2)
 
     datasets = {}
-    edges = zip(file_edges + 1, file_edges[1:])
-    for i, (left_edge, right_edge) in enumerate(edges):
-        dataset = [d.split() for d in data[left_edge:right_edge]]
-        if len(dataset) > 10:
-            ncol_raw = np.array(lmap(len, dataset))
-            ncol = np.median(ncol_raw)
-            header_index = np.where(ncol_raw == ncol - 1)[0][-1]
-            header = dataset[header_index]
-            ds_header = dataset[header_index + 1:]
-            # to ensure the header is unique
-            header = ['{0} {1}'.format(j, hj) for j, hj in enumerate(header,
-                                                                     start=1)]
-            index = np.array([d[0] for d in ds_header], dtype=int)
-            dataset = np.array([d[1:] for d in ds_header], dtype=float)
-            datasets[i] = DataFrame(dataset, index, columns=header)
+    for i, (left_edge, right_edge) in enumerate(fragments):
+        src = data[left_edge:right_edge]
 
+        # the table starts at the first line beginning with ','
+        start = [m.start() for m in re.finditer('^\s*,', src, re.M)][0]
+
+        key = i
+        if start > 0:
+            key = src[:start].replace('\r\n', ' ').strip()
+        
+        df = read_csv(StringIO('Date' + src[start:]), **params)
+
+        try: df = df.to_period()
+        except: pass
+        
+        datasets[key] = df
+
+    desc = ''.join([data[l:r] for l, r in doc]).strip()
+    keys_str = '\r\n'.join(map(str, datasets.keys()))
+    datasets['DESCR'] = _DOC_TEMPLATE.format(desc, keys_str)
+    
     return datasets
 
 
